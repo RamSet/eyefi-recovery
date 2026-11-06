@@ -329,6 +329,11 @@ class Channel:
         if len(request) != BLOCK:
             raise ValueError("Request must be one full channel block")
         sequence = (struct.unpack_from("<I", self.transfer("RSPC"))[0] + 1) & 0xffffffff
+        # A freshly reset card reads RSPC as 0xffffffff, which wraps to 0 here,
+        # and the firmware ignores a zero sequence (REQC == 0 means "no request").
+        # Seed the same way eyefi-config does instead of looking hung forever.
+        if sequence == 0:
+            sequence = 0x1234
         self.transfer("REQM", request)
         control = bytearray(BLOCK)
         struct.pack_into("<I", control, 0, sequence)
@@ -433,6 +438,7 @@ def firmware_exposes_upload_key(firmware):
 # as the literal default rather than duplicated as an entry.
 KNOWN_CRASH_TRIGGERS = {
     "5.2010": ord("\x01"),  # found via `sweep --scan-every 1`; checkpoints a dump with no drop
+    "5.2011": ord("\x01"),  # same byte, confirmed separately on this exact (different) build
 }
 
 
@@ -826,11 +832,24 @@ def sweep_for_dump(channel, output, first, last, size, mac=None, min_byte=0x00,
     output.mkdir(parents=True, exist_ok=False)
     print("Starting sweep...", flush=True)
     try:
-        print(f"Firmware before sweep: {channel.firmware()}", flush=True)
+        firmware = channel.firmware()
+        print(f"Firmware before sweep: {firmware}", flush=True)
     except OSError as error:
         print(f"Card not responding before the sweep started: {error}", file=sys.stderr)
         raise
     candidates = _sweep_candidates(min_byte, max_byte, skip_bytes, include_o_subcodes, include_bounds_matrix)
+    # If this exact firmware already has a confirmed trigger (same table `crash`
+    # auto-picks from), try it first rather than walking the full byte range to
+    # reach it -- it's still tried through the ordinary loop below, so a miss
+    # (a stale/wrong table entry) just falls through to the rest of the sweep.
+    known_byte = KNOWN_CRASH_TRIGGERS.get(_firmware_version_token(firmware))
+    if known_byte is not None:
+        known_label = f"cmd=0x{known_byte:02x}"
+        positions = [i for i, (label, _) in enumerate(candidates) if label == known_label]
+        if positions and positions[0] != 0:
+            candidates.insert(0, candidates.pop(positions[0]))
+            print(f"Firmware has a known trigger byte 0x{known_byte:02x} for this exact version; "
+                  "trying it first.", flush=True)
     skipped = sorted(b for b in skip_bytes if min_byte <= b <= max_byte)
     if skipped:
         vprint(f"Skipping known Wi-Fi command bytes: {', '.join(f'0x{b:02x}' for b in skipped)} "
