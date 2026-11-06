@@ -10,15 +10,26 @@ Dumps and extracted keys are sensitive. Do not publish them.
 
 | Part | Status |
 | --- | --- |
-| Firmware 4.5166 dump layout, key recovery | Verified on Windows by the original project: one X2 card, keys recovered, one key used for real uploads. |
 | Linux port of the same commands | Verified against live hardware: `scan`/`read`/`log`/`firmware` round-trip correctly over `O_DIRECT` on a real card. |
 | `crash` (`?` / `0x3f` assertion trigger) | Traced on firmware 4.5166 only. Unverified against live hardware on any OS; the opcode did nothing on a 5.0018 card. |
 | Firmware 5.0 cards | `scan`/`read`/`log`/`firmware`/`reboot-dump` verified on one card reporting `5.0018`. The `crash` opcode does not apply to this firmware. |
-| `info` (direct upload-key query) | Ported from eyefi-config's real source. Confirmed to read firmware/MAC/card-key correctly; the upload-key query itself has only been tried on a card where it legitimately returned empty, not yet on one known to expose a real key this way. |
+| `info` (direct upload-key query) | Ported from eyefi-config's real source. Confirmed to read firmware/MAC/card-key correctly; the upload-key query returns a real, working key on firmware 5.2010 and 5.2011, and legitimately returns empty on 5.0018/5.0019 (those need a dump-based method). |
 | `wifi` (scan/list/add/remove/test) | Ported from eyefi-config's real source (`network_action`/`scan_nets`/etc., not guessed), and the WPA key derivation matches a fresh `hashlib.pbkdf2_hmac` call exactly. **Not yet exercised against live hardware** — review the protocol yourself before relying on it to reconfigure a card you can't easily recover. |
 | Firmware `5.2010` cards | `sweep --scan-every 1` found command byte `0x01` as a trigger on one card reporting `5.2010`: it checkpointed a dump *without the card ever dropping*, caught only by the periodic in-memory peek (not the drop-watch). Confirms that peek path matters in practice, not just in theory. `0x01` is firmware/card-specific like every other trigger byte here, not a general answer. |
 | `restore-channels` | Creates `EyeFi/{reqc,reqm,rspc,rspm}` after a format wipes them (same mechanism as eyefi-config's `create_control_files`) and recovered a real card. Its first version's volume-ID gate refused on a genuine Eye-Fi card — it checked `/dev/disk/by-uuid/AA52-6922`, which every Eye-Fi card shares, so that symlink can point at the wrong card; fixed to ask the mounted device directly via `blkid`, with `--force` as an escape hatch if detection is still wrong. `recover` now calls this automatically when the channel directory is missing. |
-| `recover` | Runs the direct-query / existing-dump / reboot-dump ladder from "Reading the firmware version" automatically, stopping at the first success; auto-heals a missing `EYEFI` dir via `restore-channels` first. Not yet exercised against real hardware — verified only with fake `Channel`s covering each ladder step and the missing-directory path. |
+| `recover` | Runs the direct-query / existing-dump / reboot-dump ladder from "Reading the firmware version" automatically, stopping at the first success; auto-heals a missing `EYEFI` dir via `restore-channels` first. Verified on real cards: direct query on 5.2010/5.2011, reboot-dump on 5.0018/5.0019, and the missing-directory path on a camera-formatted card. |
+
+### Tested firmware
+
+All live testing for this project was done on these cards. Anything about other firmware (including the 4.x builds the `?` trigger byte was originally traced on) is inherited from upstream analysis and has not been verified here.
+
+| Firmware | Card | What worked |
+| --- | --- | --- |
+| 5.0018 | X2 | `scan`, `read`, `log`, `firmware`, `info` (upload key empty), `reboot-dump` recovers the key |
+| 5.0019 | X2 | same as 5.0018; `reboot-dump` recovers the key |
+| 5.2010 | X2 | `info` returns the key directly; `sweep` found `0x01` as a dump trigger |
+| 5.2011 | X2 | `info` returns the key directly; `reboot-dump` sometimes leaves the card unresponsive until reinserted |
+| 5.3008 | Mobi | first request after mount can time out once; the automatic retry handles it |
 
 Treat a result as unconfirmed on hardware you have not tried it on yourself.
 
