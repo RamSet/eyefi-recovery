@@ -1,394 +1,222 @@
-# eyefi-recovery
+# eyefi-key
 
-A single-file, dependency-free Python tool for working with Eye-Fi SD cards after
-Eye-Fi's servers went away. Its main job is to **recover the per-card upload key**
-that a replacement server (for example an eyefi-server or Eye-Fi emulator) needs
-in order to accept uploads from the card. It also reads firmware details, repairs
-a card whose control files were wiped by a format, and configures the card's Wi-Fi.
+A single standalone Python file for Eye-Fi SD cards: reads diagnostics, recovers upload keys (by direct query where the firmware exposes one, otherwise from a crash dump), and configures Wi-Fi — over the card's `EYEFI` request channel. No separate `eyefi-config` binary is required; its Wi-Fi protocol and this tool's key-recovery methods are all in this one file.
 
-Everything lives in `eyefi_diagnostic.py`. Copy that one file to any Linux machine
-with Python 3 and an SD card slot and run it.
+Forked from [attikov/eyefi-uploadkey](https://github.com/attikov/eyefi-uploadkey), which was written for Windows. Not affiliated with or endorsed by Eye-Fi. Use it only on cards you own or are authorized to examine.
 
-> Not affiliated with or endorsed by Eye-Fi. Use only on cards you own or are
-> authorised to examine. Dumps and recovered keys are secrets: do not share them.
+Dumps and extracted keys are sensitive. Do not publish them.
 
----
+## Status
 
-## Table of contents
+| Part | Status |
+| --- | --- |
+| Firmware 4.5166 dump layout, key recovery | Verified on Windows by the original project: one X2 card, keys recovered, one key used for real uploads. |
+| Linux port of the same commands | Verified against live hardware: `scan`/`read`/`log`/`firmware` round-trip correctly over `O_DIRECT` on a real card. |
+| `crash` (`?` / `0x3f` assertion trigger) | Traced on firmware 4.5166 only. Unverified against live hardware on any OS; the opcode did nothing on a 5.0018 card. |
+| Firmware 5.0 cards | `scan`/`read`/`log`/`firmware`/`reboot-dump` verified on one card reporting `5.0018`. The `crash` opcode does not apply to this firmware. |
+| `info` (direct upload-key query) | Ported from eyefi-config's real source. Confirmed to read firmware/MAC/card-key correctly; the upload-key query itself has only been tried on a card where it legitimately returned empty, not yet on one known to expose a real key this way. |
+| `wifi` (scan/list/add/remove/test) | Ported from eyefi-config's real source (`network_action`/`scan_nets`/etc., not guessed), and the WPA key derivation matches a fresh `hashlib.pbkdf2_hmac` call exactly. **Not yet exercised against live hardware** — review the protocol yourself before relying on it to reconfigure a card you can't easily recover. |
+| Firmware `5.2010` cards | `sweep --scan-every 1` found command byte `0x01` as a trigger on one card reporting `5.2010`: it checkpointed a dump *without the card ever dropping*, caught only by the periodic in-memory peek (not the drop-watch). Confirms that peek path matters in practice, not just in theory. `0x01` is firmware/card-specific like every other trigger byte here, not a general answer. |
+| `restore-channels` | Creates `EyeFi/{reqc,reqm,rspc,rspm}` after a format wipes them (same mechanism as eyefi-config's `create_control_files`) and recovered a real card. Its first version's volume-ID gate refused on a genuine Eye-Fi card — it checked `/dev/disk/by-uuid/AA52-6922`, which every Eye-Fi card shares, so that symlink can point at the wrong card; fixed to ask the mounted device directly via `blkid`, with `--force` as an escape hatch if detection is still wrong. `recover` now calls this automatically when the channel directory is missing. |
+| `recover` | Runs the direct-query / existing-dump / reboot-dump ladder from "Reading the firmware version" automatically, stopping at the first success; auto-heals a missing `EYEFI` dir via `restore-channels` first. Not yet exercised against real hardware — verified only with fake `Channel`s covering each ladder step and the missing-directory path. |
 
-- [Background](#background)
-- [Requirements](#requirements)
-- [Quick start](#quick-start)
-- [How the card is detected](#how-the-card-is-detected)
-- [Commands](#commands)
-  - [recover](#recover) (start here)
-  - [info](#info)
-  - [firmware](#firmware)
-  - [scan](#scan)
-  - [extract](#extract)
-  - [reboot-dump](#reboot-dump)
-  - [restore-channels](#restore-channels)
-  - [wifi](#wifi)
-  - [crash](#crash) (experimental)
-  - [sweep](#sweep) (experimental)
-  - [read / log](#read--log)
-- [Output and `--save-keys`](#output-and---save-keys)
-- [Which method works on which firmware](#which-method-works-on-which-firmware)
-- [After a format: why the EyeFi folder is gone](#after-a-format-why-the-eyefi-folder-is-gone)
-- [Troubleshooting](#troubleshooting)
-- [How it talks to the card](#how-it-talks-to-the-card)
-- [Safety notes](#safety-notes)
-- [Credits](#credits)
-
----
-
-## Background
-
-An Eye-Fi card uploads photos to a server and authenticates with a 128-bit
-**upload key** that was set at the factory and registered with Eye-Fi's cloud.
-The official software is gone, and so is the only place that key was ever shown.
-Without it, a self-hosted server cannot verify the card's uploads.
-
-The key is still on the card. Depending on firmware, it can be obtained by:
-
-1. **Asking the card directly.** Firmware 5.2 and later answers a plain query with
-   the key. This is the same query the classic `eyefi-config -u` sends.
-2. **Reading a crash dump the card already left behind.** The card keeps up to a
-   few internal dump slots. If it has ever crashed, a slot holds a memory image
-   that contains the board-data record, and the keys are at fixed offsets inside it.
-3. **Making the card write a fresh dump.** On some firmware (traced on 5.0018)
-   the ordinary reboot command leaves a dump behind. On others, a specific
-   command byte checkpoints one.
-
-`recover` tries those in that order, least intrusive first, and stops at the
-first success.
+Treat a result as unconfirmed on hardware you have not tried it on yourself.
 
 ## Requirements
 
-- Linux. The tool reads `/proc/mounts` and uses `O_DIRECT` for uncached I/O.
-- Python 3.8 or newer. Standard library only, no `pip install`.
-- A card reader. A USB reader or a laptop's built-in SD slot both work.
-- The card mounted read-write as a normal FAT volume (your desktop usually does
-  this automatically under `/media/<user>/...` or `/run/media/<user>/...`).
-- `blkid` is used when available to confirm a card's volume ID. It is optional
-  except for `restore-channels`, where the check protects you from writing to
-  the wrong device. Root (or `sudo blkid`) may be needed for that one check.
+- Python 3, standard library only. No third-party packages.
+- Linux for direct card access through a USB SD reader.
+- Card mounted **writable**. The request channel is written to.
+- Close any other Eye-Fi configuration program first, so they don't use the channel at the same time.
 
-No root is needed for the normal recovery path.
+`extract` works on a saved dump file on any OS with Python 3. It does not touch the card.
 
-## Quick start
+**On an Eye-Fi Mobi**, the very first query after mounting can time out even though the card is fine — seen in practice on firmware `5.3008`, and plausibly a Wi-Fi radio that only wakes on the write, though that's not confirmed. The tool now retries automatically: if a `Channel`'s *first* request ever times out, it resubmits once from scratch (not just waits longer on the stale one) before giving up. Once any request has succeeded, later timeouts are treated as real again — this does not mask `sweep`'s own drop detection, which depends on a timeout meaning exactly that. If the very first retry also fails, that's worth taking seriously rather than retrying indefinitely yourself.
 
-```sh
-# 1. Insert the card and let it mount.
-# 2. Run the all-in-one recovery:
-python3 eyefi_diagnostic.py recover
+## Usage
+
+Run from the directory containing `eyefi_diagnostic.py`. Every command below takes the card's mount point as an argument; **omit it and the tool auto-detects** the single mounted filesystem with an `EYEFI`/`EyeFi`/`eyefi` directory, in any of those three casings (scanning `/proc/mounts`). If none is mounted, or more than one is, it refuses rather than guessing — pass the path explicitly in that case. Auto-detection never mounts anything itself. An explicit path is checked the same way: passing the mount point looks for all three casings beneath it, and passing the directory itself works in any casing at all.
+
+Scan the known dump slots and extract keys from whichever card is plugged in:
+
+```bash
+python3 eyefi_diagnostic.py
 ```
 
-Typical output:
+With no arguments at all this auto-detects the card and runs `scan`. Give a path explicitly (`python3 eyefi_diagnostic.py /media/user/EYEFI`) if you have more than one card mounted, or just to be specific. It saves dump slot 1 into a new timestamped directory beside the script, then searches it for board-data records. The firmware mirrors the same crash record into all three slots, so reading one is enough; pass `--last-index 3` to read all three if you ever hit a card where slot 1 is empty but the others are not.
 
-```
-Card MAC: 001856xxxxxx   Upload key: 0123456789abcdef0123456789abcdef   direct query
-```
+Choose the output directory and filter by MAC:
 
-Add `--save-keys` to append the result to `eyefi-keys.json` next to the script,
-and `-v` to see every step.
-
-If the card has no `EyeFi` folder (it was formatted), auto-detect has nothing to
-find. Pass the mount point explicitly and the tool will recreate the folder first:
-
-```sh
-python3 eyefi_diagnostic.py recover /media/you/EYE-FI
+```bash
+python3 eyefi_diagnostic.py scan /media/user/EYEFI --output-dir ~/eyefi-backups/scan-001 --mac 00:11:22:33:44:55
 ```
 
-## How the card is detected
+Extract keys from a saved dump, without the card:
 
-Most commands take an optional `drive` argument, the card's mount point. If you
-omit it, the tool reads `/proc/mounts` and looks for a mounted volume that has an
-`EYEFI`, `EyeFi` or `eyefi` directory. Exactly one match is required; with zero
-or two or more it refuses and asks you to name the mount point.
-
-Mount points with spaces in the volume label (for example a camera-formatted
-`NIKON D7000`) are handled; the octal escapes in `/proc/mounts` are decoded.
-
-Auto-detect keys off the `EyeFi` folder, so a freshly formatted card is
-invisible to it. See [restore-channels](#restore-channels).
-
-## Commands
-
-Global flag on every subcommand: `-v` / `--verbose` prints per-slot and per-step
-progress. Without it, card operations print only the final MAC and key line.
-Colour is used only when stdout is a terminal and `NO_COLOR` is unset.
-
-### recover
-
-```
-recover [drive] [--output-dir DIR] [--bytes N] [--wait-timeout S] [--mac MAC]
-        [--no-reboot] [--force] [--save-keys [FILE]]
+```bash
+python3 eyefi_diagnostic.py extract ~/eyefi-backups/scan-001/dump3.response.bin
 ```
 
-The one command most people need. Runs the ladder:
+Read one dump range to a file:
 
-1. Direct query (`info`). Works on firmware 5.2 and later.
-2. Existing dump slots (`scan` over slots 1 to 3, then `extract`).
-3. Reboot-dump (`reboot-dump`): sends the reboot command, waits for the card to
-   remount, scans again.
-
-Stops at the first method that yields a key. `--no-reboot` stops after step 2,
-which makes the whole run read-only. `--output-dir` names where the reboot-dump
-backup goes; it must not already exist.
-
-If the `EyeFi` folder is missing, `recover <drive>` first runs the equivalent of
-`restore-channels` on it. That step verifies the volume ID; `--force` skips the
-verification if you have confirmed the card yourself.
-
-The experimental `crash` method is deliberately **not** part of `recover`. Run it
-by hand if the ladder fails.
-
-### info
-
-```
-info [drive]
+```bash
+python3 eyefi_diagnostic.py read /media/user/EYEFI --dump-index 3 --bytes 327680 --output ~/eyefi-backups/dump3.bin
 ```
 
-Safe queries only, no reboot, no crash. Prints firmware version, MAC, card key,
-and the upload key when the firmware exposes it (5.2+). On older firmware the
-upload key field comes back empty and you need a dump-based method.
+Read a range of the card log (first 16 KiB by default):
 
-### firmware
-
-```
-firmware [drive]
+```bash
+python3 eyefi_diagnostic.py log /media/user/EYEFI --output ~/eyefi-backups/card-log.bin
 ```
 
-Prints just the firmware version string, for example
-`5.2011 May 14 2014 23:35:48`. Useful before deciding which method to try.
+Run `python3 eyefi_diagnostic.py --help` for every option. `--offset` and `--bytes` must be multiples of 16,384.
 
-### scan
+## Output
 
-```
-scan [drive] [--output-dir DIR] [--first-index N] [--last-index N] [--bytes N] [--mac MAC]
-```
-
-Reads the card's internal dump slots to files in a new directory (default: a
-timestamped folder next to the script), then searches each for board-data
-records and prints any keys found. Defaults read slot 1 only with 327680 bytes;
-`--last-index 3` covers all slots the cards are known to keep. Reading a slot
-that was never written just returns zeros, which is harmless.
-
-### extract
+By default the card commands (`scan`, `extract`, `read`, `reboot-dump`, `crash`, `sweep`) are quiet: they print only the final result, one line per distinct card, with the upload key highlighted in green on a terminal:
 
 ```
-extract FILE [--mac MAC]
+Card MAC: 0018560000aa   Upload key: 00112233445566778899aabbccddeeff
 ```
 
-Offline. Searches an already-saved dump file for board-data records and prints
-MAC and keys. Use this on dumps you collected earlier or on another machine.
-No card needed.
+`sweep` appends where it was found (e.g. `found at byte cmd=0x4b`, or `already present on card`). Colour is applied only to a real terminal and is suppressed if `NO_COLOR` is set or output is piped.
 
-### reboot-dump
+Pass `-v`/`--verbose` for the full detail — each slot read, every board-data record with its offset, the saved-scan path, and the per-byte sweep chatter. A scan still always writes `dump1.response.bin` (and `dump2`/`dump3` only with `--last-index 3`) plus `results.json` to its output directory regardless of verbosity, so the raw data is kept either way. In verbose mode each record shows its offset, MAC, and the key at board-data offset `+0x40` (the one that worked in desktop mode on the tested card).
 
-```
-reboot-dump [drive] [--output-dir DIR] [--first-index N] [--last-index N]
-            [--bytes N] [--wait-timeout S] [--mac MAC]
-```
+Keys are read from the card's saved memory. They are not calculated from the MAC address. If two different keys appear for the same MAC, both are reported rather than one being chosen.
 
-Sends the ordinary reboot command (the same one `eyefi-config -b` sends), waits
-up to `--wait-timeout` seconds (default 60) for the card to drop and remount,
-then scans the dump slots. Traced to leave a dump on firmware 5.0018. Do not run
-it while the card is busy writing photos.
+### Keeping a local record of recovered keys
 
-The card will disappear from the system for a few seconds. On some built-in
-readers the whole reader detaches when the card resets; if the card does not
-come back on its own, pull it and reinsert.
-
-### restore-channels
-
-```
-restore-channels DRIVE [--force]
+```bash
+python3 eyefi_diagnostic.py scan --save-keys
 ```
 
-Recreates the `EyeFi` folder and its four control files (`REQM`, `REQC`, `RSPM`,
-`RSPC`, each 16384 zero bytes). You need this after formatting the card in a
-camera or computer, because the firmware does **not** recreate them itself.
+Add `--save-keys` to `extract`, `scan`, `read`, `reboot-dump`, `crash`, or `sweep` and any key found is appended to a local `{mac: [keys...]}` JSON file (`eyefi-keys.json` beside the script by default; give it a path, `--save-keys other.json`, to use a different one). It's off by default — nothing is saved unless you ask. A MAC that already has a different key on file keeps both rather than picking one, and the tool tells you about the conflict; it never silently overwrites. **This never writes anything to the card** — there is no verified command to assign an upload key onto a card, only to read one. Keep this file private; it's gitignored for exactly that reason.
 
-`DRIVE` is required. Before writing anything, the tool reads the device's volume
-ID and refuses unless it is `AA52-6922`, the factory ID every Eye-Fi card
-carries. `--force` skips that check if `blkid` is unavailable and you have
-verified the card another way.
+## Reading the firmware version
 
-### wifi
-
-```
-wifi scan   [drive]
-wifi list   [drive]
-wifi add    [drive] ESSID [--password PW] [--force]
-wifi remove [drive] ESSID
-wifi test   [drive] ESSID [--password PW]
+```bash
+python3 eyefi_diagnostic.py firmware /media/user/EYEFI
 ```
 
-Ported from eyefi-config's network commands. `add` tests the connection first,
-like the original tool, and saves the network only if the test passes; `--force`
-saves regardless. Passwords may be a WPA passphrase or a raw 64/26/10 hex-digit
-key; omit for an open network.
+Prints the card's reported firmware version (command `o`). Nothing is written to the card.
 
-A test that gets Wi-Fi association and a DHCP lease but then stalls at "reaching
-Eye-Fi's cloud" is counted as a pass, because that cloud no longer exists.
+For firmware/MAC/card-key/upload-key together in one safe, read-only pass (no crash, no reboot):
 
-### crash
-
-```
-crash [drive] [--command BYTE] [--output-dir DIR] [--first-index N] [--last-index N] [--bytes N]
+```bash
+python3 eyefi_diagnostic.py info /media/user/EYEFI
 ```
 
-**Experimental.** Backs up the current dump slots to a new directory, then sends
-one host command byte intended to make the firmware write a fresh dump. With no
-`--command`, it picks a confirmed trigger if the exact firmware is in the
-tool's known-trigger table (currently 5.2010, byte `0x01`, which checkpoints a
-dump without even dropping the card), otherwise it falls back to `?` (`0x3f`),
-which was traced on firmware 4.5166 only.
+The upload key here comes from a direct query (`o`, sub-command `0xfd` — the same one `eyefi-config -u` uses), not from a dump. If it reads back empty, `info` prints the firmware-aware explanation (does this firmware expose it via query at all, per the same threshold eyefi-server uses) plus a concrete next-steps order, since an empty query reading is **not** proof the key doesn't exist:
 
-The card may reset, drop off USB, or do nothing. Photos on the FAT volume are
-not touched, but take a backup anyway.
+1. `scan` — read-only; the key may already be sitting in an existing dump slot (this has happened more than once in practice; always try this first).
+2. `reboot-dump` — an ordinary reboot; confirmed to leave the key behind on firmware 5.0018/5.0019.
+3. `sweep` — find a trigger byte for this specific firmware (or `crash --command 0x<byte>` once you already know one).
+4. `scan` again after step 2 or 3, to read whatever was left behind.
 
-### sweep
+Or run that order automatically:
 
-```
-sweep [drive] [--min-byte B] [--max-byte B] [--max-drops N] [--settle-timeout S]
-      [--scan-every N] [--include-wifi-bytes] [--include-o-subcodes]
-      [--include-bounds-matrix] [--output-dir DIR] [--mac MAC] ...
+```bash
+python3 eyefi_diagnostic.py recover /media/user/EYEFI
 ```
 
-**Experimental, slow.** Sends every command byte in a range, one at a time,
-waits for the card to settle after each, and scans for a new dump. Stops at the
-first hit. This is how the 5.2010 trigger was found. Bytes with known meanings
-(Wi-Fi operations, `o` sub-commands) are skipped unless you opt in. Expect many
-resets; `--max-drops` bounds them.
+`recover` tries, in order, stopping at the first that finds a key: `[1/3]` direct query (`upload_key`), `[2/3]` existing dump slots (read-only peek, nothing written to disk), `[3/3]` `reboot-dump` (writes a real backup, same as running it directly; skip with `--no-reboot`). It does *not* run `sweep` — that still needs a human watching for a card that can't afford to lose.
 
-### read / log
+If the card's `EYEFI`/`EyeFi` directory is missing entirely (a reformatted card — see `restore-channels` below), `recover` detects that and runs `restore-channels` itself first, then continues the ladder above. That case needs an explicit mount path; there's nothing for auto-detect to find until the directory exists.
 
-```
-read [drive] --output FILE --dump-index N [--offset N] [--bytes N] [--mac MAC]
-log  [drive] --output FILE [--offset N] [--bytes N]
-```
+## Wi-Fi configuration
 
-Low-level. `read` copies a byte range of one dump slot to a file; `log` copies a
-range of the card's internal text log. `--output` must be a new file on another
-volume, never on the card.
-
-## Output and `--save-keys`
-
-Quiet mode prints one line per distinct card and key:
-
-```
-Card MAC: 001856xxxxxx   Upload key: <32 hex digits>   <method>
+```bash
+python3 eyefi_diagnostic.py wifi scan /media/user/EYEFI
+python3 eyefi_diagnostic.py wifi list /media/user/EYEFI
+python3 eyefi_diagnostic.py wifi add /media/user/EYEFI "My Network" --password "passphrase"
+python3 eyefi_diagnostic.py wifi test /media/user/EYEFI "My Network" --password "passphrase"
+python3 eyefi_diagnostic.py wifi remove /media/user/EYEFI "My Network"
 ```
 
-With `-v`, dump-based methods also print the board record offset and the
-individual fields:
+Ported from [hansendc/eyefi-config](https://github.com/hansendc/eyefi-config)'s own `network_action`/`scan_nets`/`fetch_configured_nets`/`make_network_key` — read against that project's real source, not guessed, so this needs no separate binary. `add`/`test` accept a WPA passphrase (run through the standard WPA/WPA2 PBKDF2-HMAC-SHA1 passphrase-to-PSK derivation, not anything Eye-Fi-specific), or a 64/26/10-hex-digit raw key (WPA/WEP-104/WEP-40); omit `--password` for an open network. `test` polls the card's connection-test state until it reports success or gives up, printing each state change.
 
+**`add` tests the connection before committing it** — matching `eyefi-config`'s own `-a` behavior exactly: a failed test (wrong or missing password against a secured network) means nothing is added, rather than silently landing as a broken open-network entry. `--force` skips the test and adds regardless, same as `eyefi-config`'s `-a --force`. `wifi scan` shows each network's actual security type beforehand (`WPA`/`WPA2`/`WEP`/`open`) — check that before deciding whether `--password` is needed.
+
+The connection test's final stage checks reachability to Eye-Fi's own cloud service (`api.eye.fi`, read via `o` sub-command `4`) — which has been offline since Eye-Fi's 2016 shutdown and can never respond. There is no documented way to point the card at a different server instead (that field has no write path in `eyefi-config`'s own source, same as the upload key). Reaching that specific stage (`testing connection to Eye-Fi server`) only happens *after* the Wi-Fi key itself verifies, so `test`/`add` treat getting stuck there — not literal `success` — as the credentials being correct, rather than waiting out the full poll budget for a server that no longer exists.
+
+## Experimental: crash
+
+```bash
+python3 eyefi_diagnostic.py crash /media/user/EYEFI
 ```
-Board offset: 0x1a2b0; MAC: 001856xxxxxx; Desktop UploadKey: <32 hex>
+
+**This deliberately requests an assertion/reset. Live crash behavior is untested on any OS. Do not run it while the card is writing photos.**
+
+A card with no saved crash dump has no board data to read, so there is no key to recover. `crash` exists to make the firmware save a fresh dump. With no `--command`, it reads the card's exact firmware version and auto-picks a confirmed trigger byte if one is known for that exact build (`KNOWN_CRASH_TRIGGERS` in the script — currently just `5.2010` → `0x01`, found via `sweep`); otherwise it falls back to `?` (`0x3f`), which static analysis traced to assertion handling, crash-state saving and reset **on firmware 4.5166 specifically** — it is not a general-purpose trigger, and a card on other firmware may ignore it entirely (as 5.0018 does) or respond differently. Pass `--command` yourself to override either way (see `sweep` below if your firmware isn't in the known-trigger list yet).
+
+The command:
+
+1. Reads the firmware version, auto-picks a known trigger byte for that exact build if one exists, and otherwise falls back to `?` with a warning if the firmware isn't 4.5166 — but never refuses to proceed; the trigger is always sent, on any firmware.
+2. Backs up the dump slots into a new `eyefi-before-crash-*` directory. A backup I/O failure aborts before anything is sent.
+3. Sends the command byte once, with no retry (a reset may prevent an acknowledgement).
+4. Records progress in `crash-request.json` (`prepared_not_sent` → `send_started_outcome_unverified` → `request_signalled_crash_unverified`), fsynced so an abrupt reset mid-send is not mistaken for "never sent".
+
+A signalled request is not a confirmed crash or dump. After the card recovers, read its log and scan again to verify. The `?` opcode and the `o` firmware-read command come from independent static analysis of 4.5166 and are unverified against live hardware.
+
+## Recovering a key without crash: reboot-dump
+
+```bash
+python3 eyefi_diagnostic.py reboot-dump /media/user/EYEFI
 ```
 
-`--save-keys [FILE]` on `recover` (and other key-producing commands) appends to
-a JSON file shaped as `{ "<mac>": ["<key>", ...] }`. With no path it writes
-`eyefi-keys.json` beside the script. It never writes to the card.
+On a card reporting firmware **5.0018**, the `?` assertion trigger above does nothing: that opcode is specific to 4.5166. But on that card, an ordinary **reboot** (command `b`, the same one `eyefi-config -b` sends) was found to checkpoint the board data into a dump slot before the card resets — no assertion or crash required.
 
-Treat the output and the dump directories as credentials. They are
-`.gitignore` material, not something to commit.
+`reboot-dump`:
 
-## Which method works on which firmware
+1. Sends the reboot command once. A card may drop the connection immediately; that is expected, not an error.
+2. Waits for the card to respond again (`--wait-timeout`, default 60s), retrying every couple of seconds. Raises if it never comes back — check the mount and remount, after which a plain `scan` may still find the dump.
+3. Once the card answers, scans the dump slots exactly like `scan` and reports any board data found.
 
-Observed on real cards. Your mileage may vary by card model.
+This is a normal, documented card operation (reboot), not a fuzzed or out-of-range request — lower risk than `crash`, but it still disconnects the card and should not be run while it is writing photos. It was confirmed to recover a working key on one card reporting firmware 5.0018; whether a reboot checkpoints board data on other firmware versions is untested.
 
-| Firmware | Direct query (`info`) | Existing dump (`scan`) | `reboot-dump` | `crash` default |
-|---|---|---|---|---|
-| 4.5166 | no | if a dump exists | not traced | `?` traced |
-| 5.0018 | no | if a dump exists | yes | untested |
-| 5.0019 | no | if a dump exists | yes | untested |
-| 5.2010 | yes | if a dump exists | varies | `0x01`, no drop |
-| 5.2011 | yes | if a dump exists | varies, card may hang | untested |
+## Finding the trigger yourself: sweep
 
-"Varies" means it worked on some runs and on other runs the card stayed mounted
-but stopped answering until reinserted. On 5.2 firmware you never need it,
-because the direct query already returns the key.
+```bash
+python3 eyefi_diagnostic.py sweep /media/user/EYEFI
+```
 
-Inside a dump, the board-data record (marker `c0decafeaa526922`) holds three
-keys: a unique key at +0x00, a cloud key at +0x20 (used by firmware 5.0 to sign
-in to Eye-Fi's API), and the desktop upload key at +0x40. The MAC follows at
-+0x89. The desktop upload key is the one a self-hosted server wants.
+`crash`'s default byte (`?` / `0x3f`) only applies to firmware traced as 4.5166; it is not a general answer for "how do I get a dump out of this card." `reboot-dump`'s `b` byte is how the 5.0018 trigger was actually found — not by firmware analysis, but by trying command bytes against a real card and watching for one that made it drop and come back with a dump. `sweep` is that process, formalized:
 
-## After a format: why the EyeFi folder is gone
+1. Tries every command byte `0x00`–`0xff` (narrow with `--min-byte`/`--max-byte`; equal values retest one specific byte with a fresh, possibly longer `--settle-timeout`), except `a`/`d`/`t` (see below), as a bare, argument-less host command.
+2. Watches for the card to stop acknowledging — a sign it reset.
+3. After each drop, waits for the card to come back (`--settle-timeout`, default 90s) and scans the dump slots.
+4. **Checks for a dump up front, and again every `--scan-every` bytes (default 1 — after every byte tried), even without a drop** — because a trigger byte can make the firmware save a dump *while the card keeps responding normally*, which the drop-watch in step 2 would sail right past. These checks are in-memory peeks that write nothing unless they find something, so this default doesn't spray a dump directory per byte. The up-front check also means a card that already has a dump is reported immediately with no bytes sent at all. Raise `--scan-every` (or set it to `0` to disable) if you'd rather trade that precision for fewer peek reads. Confirmed to matter in practice, not just in theory: on one card reporting firmware `5.2010`, this caught byte `0x01` as a trigger that checkpointed a dump with the card never dropping at all — a plain drop-watch sweep would have walked right past it, which is why scanning after every byte is the default rather than an opt-in.
+5. **Stops at the first check that finds board data** — from a drop or a checkpoint — and does not grind through the rest. At the default `--scan-every 1` it names the exact trigger byte; with a larger value it reports which batch the trigger is in.
+6. Gives up after `--max-drops` resets (default 25) with nothing found.
 
-Formatting a card, in a camera or on a computer, wipes the FAT volume, including
-the `EyeFi` folder. The firmware never puts it back. It only reacts to the
-control files once a host has created them, which is what the official desktop
-software did silently on every insert. The volume serial `AA52-6922` survives a
-format, which is how `restore-channels` can still prove it is an Eye-Fi card.
+A live `trying cmd=0x..` line shows the current byte throughout, so stopping with Ctrl-C always tells you exactly where it was.
 
-Copying a backed-up `EyeFi` folder from another card does not reliably work.
-Freshly zeroed files created by `restore-channels` do.
+Pressing Ctrl-C mid-sweep is safe: a byte that stalls the card can leave a dump behind even as you interrupt, so on Ctrl-C the sweep waits for the card to settle and scans the slots one last time before exiting (reporting and saving any board data it finds), rather than throwing the dump away with a bare traceback. If it reports nothing but the card was still recovering, just run `scan` again a moment later.
 
-## Troubleshooting
+**`a`/`d`/`t` are skipped by default.** Reading the real `eyefi-config` source (see Wi-Fi below) confirmed these are its own wire-protocol bytes for add/remove/test-network, not crash triggers — sending them bare means an empty ESSID and no key, which just pollutes the card's Wi-Fi config for nothing. (`d` is the exact byte that dropped a card during an earlier sweep run, before this was known; `b`, reboot, stays in deliberately — it's the one byte that's actually useful to find, and how `reboot-dump`'s trigger was discovered.) Pass `--include-wifi-bytes` for a genuinely exhaustive sweep.
 
-**"Found 0 cards" / auto-detect fails.** The card is not mounted, or has no
-`EyeFi` folder. Check `mount | grep -i media`, then either mount it or run
-`restore-channels <mountpoint>`.
+**Beyond that, this is not limited to known-safe commands.** It can issue whatever else the firmware exposes for an untried byte — in principle including something destructive, not merely a reset. Only run it against a card you can afford to lose, and watch it run — it is not a fire-and-forget tool. Once it finds a working byte for your card's firmware, you don't need to sweep again: use `crash --command 0x<byte>` (or `reboot-dump` directly, if the byte turns out to be the ordinary reboot) from then on.
 
-**"Found 2 cards".** Two Eye-Fi volumes are mounted, or a stale mount is lingering
-after a reset. Pass the mount point explicitly.
+**Two further phases exist but are off by default**, from an earlier, ad hoc version of this sweep that tried more than just command bytes:
 
-**The card stops answering mid-run.** Known to happen after a reboot or crash
-command, especially in built-in Realtek readers that detach when the card
-resets. Pull the card, wait a few seconds, reinsert. If it still ignores
-requests, run `firmware` once; the tool seeds a fresh request sequence number
-and that usually unsticks it.
+- `--include-o-subcodes`: `o` sub-commands `0x20`–`0xff`, beyond the known-safe query range (firmware/MAC/card-key/upload-key etc. all sit at `0x1f` or below, or the known `0xfd`).
+- `--include-bounds-matrix`: `k`/`m` with deliberately out-of-range indices and offsets, hoping to trip a bounds check.
 
-**"File exists" for `--output-dir`.** Output directories must be new. Point it at
-a path that does not exist yet.
+Neither has ever produced a dump in the runs that found `b` and tripped on `d`/`a`/`t` — both hits came from the plain byte sweep. They're kept available for completeness, not because they're known to be useful; the bounds matrix in particular sends requests no normal client would construct.
 
-**`restore-channels` refuses the volume ID.** `blkid` could not read the device,
-usually because it needs root. Run `sudo blkid /dev/sdX1` yourself; if it shows
-`AA52-6922`, rerun with `--force`.
+To re-check a specific byte with more patience — for example if an earlier run's wait wasn't long enough to see whether a dump actually appeared — retest just that byte:
 
-**Direct query returns an empty key.** Firmware is older than 5.2. Use
-`recover`, which falls through to the dump methods.
+```bash
+python3 eyefi_diagnostic.py sweep /media/user/EYEFI --min-byte 0x50 --max-byte 0x50 --settle-timeout 180
+```
 
-**Key recovered, but the server still rejects uploads.** Make sure you used the
-desktop upload key (+0x40), not the cloud key (+0x20). With `-v` the tool labels
-them.
+## Changes from the original
 
-## How it talks to the card
+- Card access uses uncached I/O (`O_DIRECT`, with a `POSIX_FADV_DONTNEED` fallback where a filesystem rejects it). The firmware only responds to uncached transfers, so without this the poll loop reads a stale sequence number.
+- The code runs on Linux and needs no Windows tools.
+- The firmware-version check is removed. Every command runs on any firmware, so check the firmware version yourself before relying on the output.
 
-The card exposes a tiny request/response channel through four files in the
-`EyeFi` folder, each one 16384-byte block:
+## License
 
-| File | Role |
-|---|---|
-| `REQM` | request body, written by the host |
-| `REQC` | request sequence number; writing it tells the card a request is ready |
-| `RSPC` | response sequence number, polled by the host |
-| `RSPM` | response body, read by the host |
-
-Because the firmware writes `RSPM` behind the operating system's back, the host
-must bypass the page cache: the tool opens the files with `O_DIRECT` and falls
-back to `posix_fadvise(DONTNEED)` where `O_DIRECT` is not supported. This is the
-same trick eyefi-config uses with unbuffered I/O. Wire bytes for every command
-were taken from eyefi-config's C source, not guessed.
-
-## Safety notes
-
-- `info`, `firmware`, `scan`, `extract`, `read`, `log`, `wifi list` and
-  `recover --no-reboot` never change card state beyond the request channel.
-- `reboot-dump` resets the card. `crash` and `sweep` send bytes whose effect is
-  firmware-specific and may hang the card until reinserted. All three take a
-  dump backup first; none of them touch your photos, but back those up too.
-- Never run reset-type commands while the card is writing.
-- Dumps contain keys. Keep the output directories and `eyefi-keys.json` out of
-  version control.
-
-## Credits
-
-Protocol knowledge, command bytes and the control-file scheme come from Dave
-Hansen's [eyefi-config](https://github.com/hansendc/eyefi-config). Dump-slot
-layout and the board-data offsets were worked out by reading real cards.
+See [LICENSE](LICENSE).
