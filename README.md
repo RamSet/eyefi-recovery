@@ -21,7 +21,7 @@ Dumps and extracted keys are sensitive. Do not publish them.
 
 ### Tested firmware
 
-Dump-based key recovery was tested on X2 cards only; the Mobi was tested with the direct query. Anything about other firmware (including the 4.x builds the `?` trigger byte was originally traced on) is inherited from upstream analysis and has not been verified here.
+Dump-based key recovery was tested on X2 cards only; the Mobi Pro was tested with the direct query. Anything about other firmware (including the 4.x builds the `?` trigger byte was originally traced on) is inherited from upstream analysis and has not been verified here.
 
 | Firmware | Card | What worked |
 | --- | --- | --- |
@@ -29,7 +29,7 @@ Dump-based key recovery was tested on X2 cards only; the Mobi was tested with th
 | 5.0019 | X2 | same as 5.0018; `reboot-dump` recovers the key |
 | 5.2010 | X2 | `info` returns the key directly; `sweep` found `0x01` as a dump trigger |
 | 5.2011 | X2 | `info` returns the key directly; `sweep` found `0x01` as a dump trigger here too |
-| 5.3008 | Mobi | `info` returns the upload key directly, so no dump method is needed. `scan` of slots 0-3 gets no data for the `k` dump command, and the card's own log shows unknown bytes raise a non-fatal `eyefi_host_control.c:2234: Assertion failed!` with no reset, while `b` and `0x42` reboot it without saving anything. So neither the assertion route nor `reboot-dump` yields a dump on this firmware. First request after mount can time out once; the automatic retry handles it. |
+| 5.3008 | Mobi Pro | `info` returns the upload key directly, so no dump method is needed. `scan` of slots 0-3 gets no data for the `k` dump command, and the card's own log shows unknown bytes raise a non-fatal `eyefi_host_control.c:2234: Assertion failed!` with no reset, while `b` and `0x42` reboot it without saving anything. So neither the assertion route nor `reboot-dump` yields a dump on this firmware. First request after mount can time out once; the automatic retry handles it. |
 
 A card that stops answering right after any reset was, until this fix, the tool's own fault: a freshly reset card reads `RSPC` as `0xffffffff`, the next sequence wrapped to `0`, and the firmware ignores a zero sequence. The tool now reseeds to `0x1234` in that case, the same seed `eyefi-config` uses.
 
