@@ -21,7 +21,7 @@ Dumps and extracted keys are sensitive. Do not publish them.
 
 ### Tested firmware
 
-All live key-recovery testing for this project was done on X2 cards. Anything about other firmware (including the 4.x builds the `?` trigger byte was originally traced on) is inherited from upstream analysis and has not been verified here.
+Dump-based key recovery was tested on X2 cards only; the Mobi was tested with the direct query. Anything about other firmware (including the 4.x builds the `?` trigger byte was originally traced on) is inherited from upstream analysis and has not been verified here.
 
 | Firmware | Card | What worked |
 | --- | --- | --- |
@@ -29,7 +29,7 @@ All live key-recovery testing for this project was done on X2 cards. Anything ab
 | 5.0019 | X2 | same as 5.0018; `reboot-dump` recovers the key |
 | 5.2010 | X2 | `info` returns the key directly; `sweep` found `0x01` as a dump trigger |
 | 5.2011 | X2 | `info` returns the key directly; `reboot-dump` sometimes leaves the card unresponsive until reinserted |
-| 5.3008 | Mobi | only the first-query timeout and its automatic retry were observed. Dump slots, the board-data layout and key recovery were **not** tested on a Mobi and may differ from the X2; `extract` would then find nothing even with a dump present. |
+| 5.3008 | Mobi | `info` returns the upload key directly, so no dump method is needed. `scan --last-index 3` gets no response at all for the `k` dump command (every block came back identical to the pre-request buffer), so either the Mobi keeps no dump or uses a different mechanism; the X2 board-data layout is unverified here. `sweep` hung the card at byte `0x42` until it was reinserted. First request after mount can time out once; the automatic retry handles it. |
 
 Treat a result as unconfirmed on hardware you have not tried it on yourself.
 
