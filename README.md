@@ -1,4 +1,4 @@
-# eyefi-key
+# eyefi-recovery
 
 A single standalone Python file for Eye-Fi SD cards: reads diagnostics, recovers upload keys (by direct query where the firmware exposes one, otherwise from a crash dump), and configures Wi-Fi — over the card's `EYEFI` request channel. No separate `eyefi-config` binary is required; its Wi-Fi protocol and this tool's key-recovery methods are all in this one file.
 
